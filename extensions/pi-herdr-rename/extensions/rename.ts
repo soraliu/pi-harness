@@ -226,6 +226,7 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 
 		if (!isCurrent(request, controller)) return;
 		await herdr.run(["pane", "rename", paneId, displayTitle], { signal: controller.signal });
+		await herdr.run(["agent", "rename", paneId, displayTitle], { signal: controller.signal });
 		if (!isCurrent(request, controller)) return;
 
 		const paneResponse: unknown = await herdr.json(["pane", "get", paneId], { signal: controller.signal });

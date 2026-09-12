@@ -3,7 +3,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { createHerdrClient, withWorktreeLock } from "@henryqw/pi-herdr";
+import { createHerdrClient } from "@henryqw/pi-herdr";
 import {
 	executeTaskRoutes,
 	loadTaskModelsConfig,
@@ -73,15 +73,13 @@ function parseGeneratedTitle(title: string): GeneratedTitle | undefined {
 	};
 }
 
-function savedTitle(ctx: ExtensionContext): GeneratedTitle | undefined {
+function savedTitle(ctx: ExtensionContext): string | undefined {
 	const entry = [...ctx.sessionManager.getBranch()]
 		.reverse()
 		.find((candidate) => candidate.type === "custom" && candidate.customType === TITLE_STATE_TYPE);
 	if (entry?.type !== "custom" || !entry.data || typeof entry.data !== "object" || Array.isArray(entry.data)) return undefined;
-	const { display, branch } = entry.data as { display?: unknown; branch?: unknown };
-	return isDisplayTitle(display) && typeof branch === "string" && SEMANTIC_BRANCH.test(branch)
-		? { display, branch }
-		: undefined;
+	const { display } = entry.data as { display?: unknown };
+	return typeof display === "string" && display ? display : undefined;
 }
 
 function branchAvailable(candidate: string, branches: string[]): boolean {
@@ -222,14 +220,7 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 	const isCurrent = (request: number, controller: AbortController) =>
 		request === sequence && active === controller && !controller.signal.aborted;
 
-	const applyHerdr = async (
-		displayTitle: string,
-		branchCandidate: string,
-		previousDisplayTitle: string | undefined,
-		forceWorkspaceRename: boolean,
-		request: number,
-		controller: AbortController,
-	): Promise<void> => {
+	const applyHerdr = async (displayTitle: string, request: number, controller: AbortController): Promise<void> => {
 		const paneId = process.env.HERDR_PANE_ID;
 		if (process.env.HERDR_ENV !== "1" || !paneId) return;
 
@@ -249,48 +240,6 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 		if (paneCount === 1 && isCurrent(request, controller)) {
 			await herdr.run(["tab", "rename", tabId, displayTitle], { signal: controller.signal });
 		}
-		if (!isCurrent(request, controller)) return;
-
-		const workspaceId = pane?.workspace_id;
-		if (typeof workspaceId !== "string" || !workspaceId) throw new Error("Herdr pane response omitted workspace_id.");
-		const workspaceResponse: unknown = await herdr.json(["workspace", "get", workspaceId], { signal: controller.signal });
-		const workspace = (workspaceResponse as { result?: { workspace?: { label?: unknown; worktree?: { checkout_path?: unknown; is_linked_worktree?: unknown } } } }).result?.workspace;
-		const workspaceName = workspace?.label;
-		if (typeof workspaceName !== "string") throw new Error("Herdr workspace response omitted label.");
-		const worktree = workspace?.worktree;
-		if (
-			workspaceName !== displayTitle &&
-			(forceWorkspaceRename ||
-				(worktree?.is_linked_worktree === true &&
-					(HERDR_DEFAULT_WORKTREE_NAME.test(workspaceName) || workspaceName === previousDisplayTitle))) &&
-			isCurrent(request, controller)
-		) {
-			await herdr.run(["workspace", "rename", workspaceId, displayTitle], { signal: controller.signal });
-		}
-
-		const checkoutPath = worktree?.checkout_path;
-		if (worktree?.is_linked_worktree !== true || typeof checkoutPath !== "string" || !checkoutPath) return;
-
-		const runGit = async (args: string[]) => {
-			const result = await pi.exec("git", args, { cwd: checkoutPath, signal: controller.signal });
-			if (result.code !== 0 || result.killed) {
-				throw new Error(`git ${args.join(" ")} failed: ${result.stderr.trim() || result.stdout.trim() || (result.killed ? "killed" : `exit ${result.code}`)}`);
-			}
-			return result.stdout.trim();
-		};
-
-		await withWorktreeLock(checkoutPath, async () => {
-			if (!isCurrent(request, controller)) return;
-			const branch = await runGit(["branch", "--show-current"]);
-			if (!branch || branch.startsWith("worktree/")) {
-				if (!isCurrent(request, controller)) return;
-				const branches = (await runGit(["for-each-ref", "--format=%(refname:short)", "refs/heads"]))
-					.split("\n")
-					.filter(Boolean);
-				const semanticBranch = availableBranch(branchCandidate, branches);
-				await runGit(branch ? ["branch", "-m", semanticBranch] : ["switch", "-c", semanticBranch]);
-			}
-		});
 	};
 
 	const begin = () => {
@@ -304,21 +253,34 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 		if (isCurrent(request, controller)) active = undefined;
 	};
 
-	const rename = async (text: string, ctx: ExtensionContext, manual: boolean): Promise<string | undefined> => {
-		if (manual) {
-			automaticPending = false;
-			automaticStarted = true;
-		}
+	const rename = async (text: string, ctx: ExtensionContext): Promise<string | undefined> => {
 		const { request, controller } = begin();
 		try {
 			const title = await generateTitle(text, ctx, controller.signal);
 			if (!isCurrent(request, controller)) return;
-			const saved = savedTitle(ctx);
-			const previousDisplayTitle = saved && pi.getSessionName() === saved.display ? saved.display : undefined;
 			pi.setSessionName(title.display);
-			pi.appendEntry(TITLE_STATE_TYPE, title);
-			await applyHerdr(title.display, title.branch, previousDisplayTitle, manual, request, controller);
+			pi.appendEntry(TITLE_STATE_TYPE, { display: title.display });
+			await applyHerdr(title.display, request, controller);
 			return title.display;
+		} catch (error) {
+			if (isCurrent(request, controller)) {
+				ctx.ui.notify(error instanceof Error ? error.message : "Rename failed.", "warning");
+			}
+			return undefined;
+		} finally {
+			finish(request, controller);
+		}
+	};
+
+	const renameDirect = async (name: string, ctx: ExtensionContext): Promise<string | undefined> => {
+		automaticPending = false;
+		automaticStarted = true;
+		const { request, controller } = begin();
+		try {
+			pi.setSessionName(name);
+			pi.appendEntry(TITLE_STATE_TYPE, { display: name });
+			await applyHerdr(name, request, controller);
+			return name;
 		} catch (error) {
 			if (isCurrent(request, controller)) {
 				ctx.ui.notify(error instanceof Error ? error.message : "Rename failed.", "warning");
@@ -359,10 +321,10 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 		const title = pi.getSessionName();
 		automaticStarted = Boolean(title || latestUserText);
 		const saved = savedTitle(ctx);
-		if (!title || title !== saved?.display) return;
+		if (!title || title !== saved) return;
 
 		const { request, controller } = begin();
-		void applyHerdr(title, saved.branch, saved.display, false, request, controller)
+		void applyHerdr(title, request, controller)
 			.catch((error) => {
 				if (isCurrent(request, controller)) {
 					ctx.ui.notify(error instanceof Error ? error.message : "Rename failed.", "warning");
@@ -383,7 +345,7 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 		automaticPending = false;
 		automaticStarted = true;
 		latestUserText = event.prompt.slice(0, MAX_MESSAGE_CHARS);
-		void rename(latestUserText, ctx, false);
+		void rename(latestUserText, ctx);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
@@ -395,21 +357,27 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("rename", {
-		description: "Generate a new display title from recent user messages",
-		handler: async (_args, ctx) => {
-			const context = recentUserMessages(ctx, latestUserText);
-			if (!context) {
-				ctx.ui.notify("No user text is available to rename this chat.", "warning");
-				return;
-			}
+		description: "Generate a new display title from recent user messages, or set one directly with /rename <name>",
+		handler: async (args, ctx) => {
 			if (widgetTimer) clearTimeout(widgetTimer);
 			widgetTimer = undefined;
 			const widgetRequest = ++widgetSequence;
-			ctx.ui.setWidget(
-				WIDGET_KEY,
-				(tui, theme) => new BorderedLoader(tui, theme, "renaming...", { cancellable: false }),
-			);
-			const title = await rename(context, ctx, true);
+			const directName = args.trim();
+			let title: string | undefined;
+			if (directName) {
+				title = await renameDirect(directName, ctx);
+			} else {
+				const context = recentUserMessages(ctx, latestUserText);
+				if (!context) {
+					ctx.ui.notify("No user text is available to rename this chat.", "warning");
+					return;
+				}
+				ctx.ui.setWidget(
+					WIDGET_KEY,
+					(tui, theme) => new BorderedLoader(tui, theme, "renaming...", { cancellable: false }),
+				);
+				title = await rename(context, ctx);
+			}
 			if (widgetRequest !== widgetSequence) return;
 			if (!title) {
 				ctx.ui.setWidget(WIDGET_KEY, undefined);
